@@ -1,0 +1,11 @@
+{
+  "name": "arena-color-sort",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chrome extension that sorts Are.na channels by color",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check extension/color.js && node --check extension/content.js && node -e \"JSON.parse(require('fs').readFileSync('extension/manifest.json'))\" && npm test",
+    "zip": "cd extension && zip -qr ../arena-color-sort.zip . -x '.*'"
+  }
+}
