@@ -81,3 +81,31 @@ test('light mode ranks by whole-image lightness, not just the dominant color', (
   assert.deepEqual(darkWithYellow.color.rgb, [240, 220, 30]);
   assert.deepEqual(sortItems([darkWithYellow, paleGray], 'light').map((x) => x.i), ['pale', 'dark']);
 });
+
+test('familyOf names common colors', () => {
+  const { familyOf, familiesOf } = require('../extension/color.js');
+  const cases = {
+    red: [[220, 30, 30], [255, 0, 0], [220, 20, 60]],
+    orange: [[255, 140, 0], [240, 130, 20]],
+    yellow: [[255, 255, 0], [235, 210, 40]],
+    green: [[0, 128, 0], [40, 170, 60], [128, 128, 0]],
+    blue: [[0, 0, 255], [30, 80, 220], [0, 200, 220], [20, 30, 90]],
+    purple: [[130, 50, 200], [128, 0, 128]],
+    pink: [[255, 105, 180], [255, 192, 203], [255, 0, 255]],
+    brown: [[139, 69, 19], [120, 90, 50]],
+    white: [[250, 250, 250]], gray: [[128, 128, 128]], black: [[15, 15, 15]],
+  };
+  for (const [fam, list] of Object.entries(cases)) for (const c of list) assert.equal(familyOf(c), fam, `${c} -> ${familyOf(c)}`);
+  const c = analyzePixels(pixels([[250, 250, 250, 600], [30, 90, 230, 300], [230, 30, 30, 100]]));
+  assert.deepEqual(familiesOf(c).sort(), ['blue', 'white']);
+});
+
+test('distanceTo ranks a block containing the searched color first', () => {
+  const { distanceTo, MATCH_DISTANCE } = require('../extension/color.js');
+  const blueOnWhite = analyzePixels(pixels([[250, 250, 250, 700], [30, 80, 220, 300]]));
+  const allRed = analyzePixels(pixels([[220, 30, 30, 1000]]));
+  const target = [40, 90, 230];
+  assert.ok(distanceTo(blueOnWhite, target) < MATCH_DISTANCE);
+  assert.ok(distanceTo(allRed, target) > MATCH_DISTANCE);
+  assert.equal(distanceTo(null, target), Infinity);
+});

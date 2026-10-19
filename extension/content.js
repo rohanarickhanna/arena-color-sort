@@ -7,7 +7,7 @@
   if (window.__arenaColorSort) return;
   window.__arenaColorSort = true;
 
-  const { analyzePixels, sortItems, tinyImageUrl } = globalThis.ArenaColor;
+  const { analyzePixels, sortItems, tinyImageUrl, familiesOf, distanceTo, MATCH_DISTANCE, FAMILIES } = globalThis.ArenaColor;
   const API = 'https://api.are.na/v3';
   const TOKEN_URL = 'https://www.are.na/settings/personal-access-tokens';
   const CONCURRENCY = 6;
@@ -231,7 +231,7 @@
   async function open(slug) {
     if (!slug) return;
     Object.assign(state, {
-      closed: false, slug, items: [], mode: 'spectrum', reverse: false,
+      closed: false, slug, items: [], mode: 'spectrum', reverse: false, filter: new Set(), search: null,
       channel: null, measured: 0, busy: false, cancelApply: null,
       prevOverflow: document.documentElement.style.overflow,
     });
@@ -239,24 +239,44 @@
     launch.hidden = true;
     overlay.hidden = false;
     overlay.innerHTML = `
-      <header class="bar">
-        <div class="title">
-          <span class="eyebrow">Sort by color</span>
-          <span class="name">Loading channel</span>
-        </div>
-        <div class="modes" role="radiogroup" aria-label="Order">
-          ${MODES.map(([k, label], i) => `<button role="radio" data-mode="${k}" title="${label} (${i + 1})">${label}</button>`).join('')}
-          <button class="rev" aria-pressed="false" title="Reverse">Reverse</button>
-        </div>
-        <div class="actions">
-          <button class="apply" disabled>Apply to channel</button>
-          <button class="close" aria-label="Close" title="Close (Esc)">Close</button>
-        </div>
-      </header>
-      <div class="ribbon" aria-hidden="true"></div>
-      <div class="notice" hidden></div>
-      <p class="status" aria-live="polite">Reading channel</p>
-      <main class="grid"></main>`;
+      <div class="page">
+        <header class="head">
+          <h1><span class="chan">Loading</span><span class="sep">/</span><span class="here"><span class="wheel" aria-hidden="true"></span>By color</span></h1>
+          <div class="actions">
+            <button class="btn apply" disabled>Apply to channel</button>
+            <button class="btn close" title="Close (Esc)">Close</button>
+          </div>
+        </header>
+        <section class="meta">
+          <div class="col">
+            <div class="label">Order</div>
+            <div class="opts" role="radiogroup" aria-label="Order">
+              ${MODES.map(([k, label], i) => `<button class="opt" role="radio" data-mode="${k}" title="${label} (${i + 1})">${label}</button>`).join('')}
+              <button class="opt rev" aria-pressed="false">Reverse</button>
+            </div>
+          </div>
+          <div class="col colors">
+            <div class="label">Colors <button class="clear" hidden>Clear</button></div>
+            <form class="search" role="search">
+              <label class="swatch" title="Pick a color"><input type="color" value="#2f6fdf" aria-label="Pick a color"></label>
+              <input type="search" placeholder="Search a color: red, teal, #3366ff" aria-label="Search by color" spellcheck="false" autocomplete="off">
+            </form>
+            <div class="chips" role="group" aria-label="Filter by color"></div>
+          </div>
+          <div class="col">
+            <div class="label">Info</div>
+            <div class="rows">
+              <div class="r"><span>Blocks</span><span class="v-blocks">0</span></div>
+              <div class="r"><span>Showing</span><span class="v-showing">0</span></div>
+              <div class="r"><span>No image</span><span class="v-none">0</span></div>
+            </div>
+            <p class="status" aria-live="polite">Reading channel</p>
+          </div>
+        </section>
+        <div class="ribbon" aria-hidden="true"></div>
+        <div class="notice" hidden></div>
+        <main class="grid"></main>
+      </div>`;
 
     overlay.querySelector('.close').onclick = close;
     overlay.querySelector('.rev').onclick = (e) => {
@@ -266,6 +286,25 @@
     };
     overlay.querySelectorAll('[data-mode]').forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
     overlay.querySelector('.apply').onclick = showApply;
+    overlay.querySelector('.chips').onclick = (e) => {
+      const chip = e.target.closest('[data-fam]');
+      if (!chip) return;
+      const f = chip.dataset.fam;
+      if (state.filter.has(f)) state.filter.delete(f); else state.filter.add(f);
+      render(true);
+    };
+    overlay.querySelector('.clear').onclick = () => {
+      state.filter.clear();
+      overlay.querySelector('.search [type="search"]').value = '';
+      setSearch(null);
+      render(true);
+    };
+    const form = overlay.querySelector('.search');
+    const text = form.querySelector('[type="search"]');
+    const picker = form.querySelector('[type="color"]');
+    form.onsubmit = (e) => { e.preventDefault(); };
+    text.oninput = () => { setSearch(parseColor(text.value)); render(true); };
+    picker.oninput = () => { text.value = picker.value; setSearch(parseColor(picker.value)); render(true); };
     overlay.querySelector('.ribbon').onclick = (e) => {
       const seg = e.target.closest('[data-id]');
       const tile = seg && state.tiles.get(seg.dataset.id);
@@ -277,7 +316,7 @@
       const channel = await api(`/channels/${encodeURIComponent(slug)}`);
       if (state.closed) return;
       state.channel = channel;
-      overlay.querySelector('.name').textContent = channel.title;
+      overlay.querySelector('.chan').textContent = channel.title;
       const blocks = await fetchContents(channel.id, (got, total) => {
         status(`Reading channel ${got} / ${total}`);
       });
@@ -287,17 +326,23 @@
         key: String(block.connection ? block.connection.id : `${block.type}-${block.id}`),
       }));
       buildTiles();
+      overlay.querySelector('.v-blocks').textContent = state.items.length;
       status(`Reading colors 0 / ${state.items.length}`);
       let done = 0;
       await colorBlocks(state.items, (it) => {
         done++;
+        it.checked = true;
+        if (state.search) it.dist = distanceTo(it.color, state.search);
         paintTile(it);
-        if (done % 12 === 0 || done === state.items.length) status(`Reading colors ${done} / ${state.items.length}`);
+        if (done % 12 === 0 || done === state.items.length) {
+          status(`Reading colors ${done} / ${state.items.length}`);
+          renderIndex();
+        }
       });
       if (state.closed) return;
       const measured = state.items.filter((it) => it.color).length;
       const without = state.items.length - measured;
-      status(`${measured} blocks sorted by color` + (without ? `, ${without} without an image at the end` : ''));
+      status(without ? 'Blocks without an image go last.' : '');
       overlay.querySelector('.apply').disabled = false;
       render(true);
       showRestoreIfSaved();
@@ -359,9 +404,9 @@
         ? `<img src="${esc(thumb)}" alt="${esc(b.image.alt_text || '')}" loading="lazy" decoding="async">`
         : `<div class="text">${esc(textSnippet(b)) || esc(blockLabel(b))}</div>`;
       return `<a class="tile" data-id="${esc(it.key)}" href="${esc(blockUrl(b))}" target="_blank" rel="noopener">
-          <div class="frame">${body}</div>
-          <div class="pal"></div>
+          <div class="frame${thumb ? '' : ' is-text'}">${body}</div>
           <div class="cap">${esc(blockLabel(b))}</div>
+          <div class="dots"></div>
         </a>`;
     }).join('');
     state.tiles = new Map();
@@ -371,9 +416,9 @@
   function paintTile(it) {
     const tile = state.tiles && state.tiles.get(it.key);
     if (!tile || !it.color) return;
-    tile.querySelector('.pal').innerHTML = it.color.palette
-      .map((p) => `<i style="background:${rgb(p.rgb)};flex:${p.weight}"></i>`).join('');
-    tile.style.setProperty('--dom', rgb(it.color.rgb));
+    it.fams = familiesOf(it.color);
+    tile.querySelector('.dots').innerHTML = it.color.palette.slice(0, 4)
+      .map((p) => `<i style="background:${rgb(p.rgb)}"></i>`).join('');
     tile.title = `${blockLabel(it.block)}\nDominant ${hex(it.color.rgb)}`;
   }
 
@@ -387,10 +432,58 @@
     return sortItems(state.items, state.mode, state.reverse);
   }
 
+  const inFilter = (it) => !state.filter.size || (it.fams || []).some((f) => state.filter.has(f));
+  const visible = (it) => inFilter(it) && (!state.search || it.dist <= MATCH_DISTANCE);
+
+  // Any CSS color the browser understands: names, hex, rgb(), hsl().
+  const parser = new OffscreenCanvas(1, 1).getContext('2d');
+  function parseColor(value) {
+    const v = value.trim();
+    if (!v) return null;
+    parser.fillStyle = '#000';
+    parser.fillStyle = v;
+    const a = parser.fillStyle;
+    parser.fillStyle = '#fff';
+    parser.fillStyle = v;
+    if (a !== parser.fillStyle) return null; // not a color: both defaults survived
+    parser.fillRect(0, 0, 1, 1);
+    const d = parser.getImageData(0, 0, 1, 1).data;
+    return [d[0], d[1], d[2]];
+  }
+
+  function setSearch(target) {
+    state.search = target;
+    const form = overlay.querySelector('.search');
+    form.classList.toggle('on', !!target);
+    if (target) {
+      form.querySelector('.swatch').style.background = rgb(target);
+      form.querySelector('[type="color"]').value = hex(target);
+      for (const it of state.items) it.dist = distanceTo(it.color, target);
+    } else {
+      form.querySelector('.swatch').style.background = '';
+    }
+  }
+
+  // The color index: one chip per family present in the channel, with counts.
+  function renderIndex() {
+    const counts = new Map();
+    for (const it of state.items) for (const f of it.fams || []) counts.set(f, (counts.get(f) || 0) + 1);
+    overlay.querySelector('.chips').innerHTML = FAMILIES.filter(([k]) => counts.has(k)).map(([k, name, c]) =>
+      `<button class="chip" data-fam="${k}" aria-pressed="${state.filter.has(k)}" title="${name}: ${counts.get(k)} blocks">
+        <i style="background:${rgb(c)}"></i><span>${name}</span><b>${counts.get(k)}</b></button>`).join('');
+    overlay.querySelector('.clear').hidden = !state.filter.size && !state.search;
+    overlay.querySelector('.v-showing').textContent = state.items.filter(visible).length;
+    overlay.querySelector('.v-none').textContent = state.items.filter((it) => !it.color && it.checked).length;
+  }
+
   function render(animate) {
     if (!state.items.length) return;
     const grid = overlay.querySelector('.grid');
-    const order = currentOrder();
+    const order = (state.search
+      ? state.items.slice().sort((a, b) => a.dist - b.dist)
+      : currentOrder()).filter(visible);
+    for (const it of state.items) state.tiles.get(it.key).hidden = !visible(it);
+    renderIndex();
     const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
     const before = animate && !reduce ? new Map() : null;
     if (before) {
@@ -595,123 +688,147 @@
 
   // ---------- styles ----------
 
+  // Matches are.na: its "areal" face (already loaded by the page), #333 ink,
+  // #696969 secondary, hairline rules, 3px flat buttons, navy primary.
   function CSS() {
     return `
       :host { all: initial; }
       * { box-sizing: border-box; }
       [hidden] { display: none !important; }
       .launch, .overlay {
-        --paper: #ffffff; --wash: #f4f4f2; --ink: #1d1d1b; --mute: #8a8a86; --line: #e3e3df;
-        --accent: #1d1d1b; --on-accent: #ffffff;
-        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+        --bg: #fff; --ink: #333; --mute: #696969; --rule: #ededed; --rule2: #f7f7f7;
+        --btn: #f7f7f7; --pri: rgb(0 7 95); --on-pri: #fff;
+        font: 12.5px/16.875px areal, "areal Fallback", Arial, Helvetica, sans-serif;
         color: var(--ink); -webkit-font-smoothing: antialiased;
       }
       @media (prefers-color-scheme: dark) {
         .launch, .overlay {
-          --paper: #141413; --wash: #1e1e1c; --ink: #ececea; --mute: #8d8d88; --line: #2d2d2a;
-          --accent: #ececea; --on-accent: #141413;
+          --bg: #000; --ink: #e5e5e5; --mute: #b2b2b2; --rule: #262626; --rule2: #1a1a1a;
+          --btn: #1a1a1a; --pri: rgb(226 223 233); --on-pri: #000;
         }
       }
-      button { font: inherit; color: inherit; cursor: pointer; }
-      button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+      button { font: inherit; color: inherit; cursor: pointer; background: none; border: 0; padding: 0; text-align: left; }
+      button:focus-visible, a:focus-visible, input:focus-visible { outline: 1px solid var(--ink); outline-offset: 2px; }
+
+      .wheel {
+        display: inline-block; flex: none; width: 14px; height: 14px; border-radius: 50%;
+        background: conic-gradient(from 20deg, #e5484d, #f59e0b, #e9d63c, #46a758, #12a594, #0090ff, #6e56cf, #d6409f, #e5484d);
+        -webkit-mask: radial-gradient(circle, transparent 3px, #000 3.5px);
+                mask: radial-gradient(circle, transparent 3px, #000 3.5px);
+      }
+
+      .btn, .launch, .notice button {
+        display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+        border: 1px solid transparent; border-radius: 3px; background: var(--btn);
+        font-weight: 700; line-height: 0; white-space: nowrap; color: var(--ink);
+      }
+      .btn:hover:not(:disabled), .notice button:hover { border-color: var(--rule); }
+      .btn:disabled { opacity: .4; cursor: default; }
+      .notice .primary { background: var(--pri); color: var(--on-pri); }
 
       .launch {
         position: fixed; right: 20px; bottom: 20px; z-index: 2147483646;
-        display: inline-flex; align-items: center; gap: 8px;
-        padding: 9px 14px 9px 10px; border: 1px solid var(--line); border-radius: 999px;
-        background: color-mix(in srgb, var(--paper) 88%, transparent);
-        backdrop-filter: blur(12px) saturate(1.4); -webkit-backdrop-filter: blur(12px) saturate(1.4);
-        box-shadow: 0 6px 24px rgb(0 0 0 / .08), 0 1px 2px rgb(0 0 0 / .06);
-        transition: transform .2s ease, box-shadow .2s ease;
+        height: 28px; padding: 0 12px 0 9px; box-shadow: 0 1px 4px rgb(0 0 0 / .12);
       }
-      .launch:hover { transform: translateY(-1px); box-shadow: 0 10px 30px rgb(0 0 0 / .12), 0 1px 2px rgb(0 0 0 / .06); }
-      .wheel {
-        width: 16px; height: 16px; border-radius: 50%;
+
+      .overlay { position: fixed; inset: 0; z-index: 2147483647; overflow-y: auto; background: var(--bg); overscroll-behavior: contain; }
+      .page { padding: 0 clamp(16px, 4.5vw, 65px) 80px; }
+
+      .head { display: flex; align-items: center; gap: 15px; padding: 28px 0 0; min-height: 90px; }
+      h1 {
+        flex: 1; min-width: 0; margin: 0; display: flex; align-items: center; gap: 15px;
+        font-size: 28px; line-height: 35px; font-weight: 700; color: var(--ink);
+      }
+      h1 .chan { color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+      h1 .sep { color: var(--mute); font-weight: 400; opacity: .6; }
+      h1 .here { display: inline-flex; align-items: center; gap: 10px; white-space: nowrap; }
+      h1 .wheel { width: 22px; height: 22px; -webkit-mask: radial-gradient(circle, transparent 5px, #000 5.5px); mask: radial-gradient(circle, transparent 5px, #000 5.5px); }
+      .actions { display: flex; gap: 5px; }
+
+      .meta { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 15px; margin-top: 45px; }
+      .label {
+        display: flex; justify-content: space-between; align-items: baseline;
+        color: var(--mute); line-height: 12.5px; padding-bottom: 2px; border-bottom: 1px solid var(--rule); margin-bottom: 15px;
+      }
+      .clear { color: var(--mute); text-decoration: underline; line-height: 12.5px; }
+      .clear:hover { color: var(--ink); }
+
+      .opts { display: flex; flex-direction: column; align-items: flex-start; border-left: 1px solid var(--rule2); }
+      .opt { position: relative; padding: 1px 0 1px 10px; font-weight: 700; color: var(--mute); }
+      .opt:hover { color: var(--ink); }
+      .opt[aria-checked="true"], .opt[aria-pressed="true"] { color: var(--ink); }
+      .opt[aria-checked="true"]::before, .opt[aria-pressed="true"]::before {
+        content: ""; position: absolute; left: -1px; top: 5px; width: 4px; height: 9px; border-radius: 1px; background: var(--mute);
+      }
+      .opt.rev { margin-top: 8px; }
+
+      .search { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+      .search input[type="search"] {
+        flex: 1; min-width: 0; height: 24px; padding: 0 8px; border: 1px solid var(--rule); border-radius: 3px;
+        background: var(--bg); color: var(--ink); font: inherit;
+      }
+      .search input[type="search"]::placeholder { color: var(--mute); }
+      .swatch {
+        position: relative; flex: none; width: 24px; height: 24px; border-radius: 50%; cursor: pointer;
         background: conic-gradient(from 20deg, #e5484d, #f59e0b, #e9d63c, #46a758, #12a594, #0090ff, #6e56cf, #d6409f, #e5484d);
-        -webkit-mask: radial-gradient(circle, transparent 3.5px, #000 4px);
-                mask: radial-gradient(circle, transparent 3.5px, #000 4px);
+        box-shadow: inset 0 0 0 1px rgb(0 0 0 / .08);
       }
+      .search.on .swatch { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--ink); }
+      .swatch input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; border: 0; padding: 0; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+      .chip { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; color: var(--mute); }
+      .chip i {
+        width: 16px; height: 16px; border-radius: 50%; flex: none;
+        box-shadow: inset 0 0 0 1px rgb(0 0 0 / .08); transition: box-shadow .15s;
+      }
+      .chip b { font-weight: 400; }
+      .chip:hover { color: var(--ink); }
+      .chip[aria-pressed="true"] { color: var(--ink); }
+      .chip[aria-pressed="true"] i { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--ink); }
 
-      .overlay {
-        position: fixed; inset: 0; z-index: 2147483647; overflow-y: auto;
-        background: var(--paper); overscroll-behavior: contain;
-        animation: rise .28s cubic-bezier(.2,.8,.2,1);
-      }
-      @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
-      @media (prefers-reduced-motion: reduce) { .overlay { animation: none; } }
+      .rows .r { display: flex; justify-content: space-between; padding: 0 0 2px; margin-bottom: 3px; border-bottom: 1px solid var(--rule2); color: var(--mute); }
+      .rows .r span:last-child { color: var(--ink); font-variant-numeric: tabular-nums; }
+      .status { margin: 8px 0 0; color: var(--mute); }
 
-      .bar {
-        position: sticky; top: 0; z-index: 2;
-        display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-        padding: 14px 24px; background: color-mix(in srgb, var(--paper) 90%, transparent);
-        backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-      }
-      .title { display: flex; flex-direction: column; min-width: 0; flex: 1 1 200px; }
-      .eyebrow { font-size: 11px; color: var(--mute); letter-spacing: .02em; }
-      .name { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-      .modes { display: flex; gap: 2px; padding: 3px; background: var(--wash); border-radius: 999px; flex-wrap: wrap; }
-      .modes button {
-        border: 0; background: transparent; padding: 6px 12px; border-radius: 999px; color: var(--mute);
-        transition: background .15s, color .15s;
-      }
-      .modes button:hover { color: var(--ink); }
-      .modes [aria-checked="true"], .modes .rev[aria-pressed="true"] {
-        background: var(--paper); color: var(--ink); box-shadow: 0 1px 3px rgb(0 0 0 / .1);
-      }
-      .modes .rev { margin-left: 6px; }
-
-      .actions { display: flex; gap: 8px; }
-      .actions button, .notice button {
-        border: 1px solid var(--line); background: var(--paper); padding: 7px 14px; border-radius: 999px;
-      }
-      .actions button:hover:not(:disabled), .notice button:hover { border-color: var(--mute); }
-      .actions button:disabled { opacity: .4; cursor: default; }
-      .notice .primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-      .notice .link { border: 0; background: none; color: var(--mute); text-decoration: underline; padding: 7px 4px; }
-
-      .ribbon { display: flex; height: 10px; margin: 0 24px; border-radius: 3px; overflow: hidden; cursor: pointer; background: var(--wash); }
+      .ribbon { display: flex; height: 6px; margin-top: 45px; overflow: hidden; cursor: pointer; }
       .ribbon i { flex: 1; min-width: 0; }
-      .ribbon i:hover { transform: scaleY(1.6); }
 
-      .notice {
-        margin: 16px 24px 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--wash);
-        max-width: 760px;
-      }
+      .notice { margin-top: 20px; padding: 12px 14px; background: var(--btn); border-radius: 3px; max-width: 640px; }
       .notice p { margin: 0 0 10px; }
       .notice a { color: inherit; }
-      .notice .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .notice .row { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+      .notice button { background: var(--bg); }
+      .notice .primary { background: var(--pri); }
+      .notice .link { background: none; text-decoration: underline; font-weight: 400; color: var(--mute); }
       .notice input {
-        flex: 1 1 260px; min-width: 0; padding: 7px 12px; border: 1px solid var(--line); border-radius: 999px;
-        background: var(--paper); color: var(--ink); font: inherit;
+        flex: 1 1 240px; min-width: 0; height: 24px; padding: 0 8px; border: 1px solid var(--rule); border-radius: 3px;
+        background: var(--bg); color: var(--ink); font: inherit;
       }
-
-      .status { margin: 14px 24px 0; color: var(--mute); font-size: 12px; font-variant-numeric: tabular-nums; }
 
       .grid {
-        display: grid; gap: 28px 20px; padding: 18px 24px 64px;
-        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        display: grid; gap: 65px 15px; margin-top: 45px;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
       }
-      .tile { display: block; color: inherit; text-decoration: none; outline: 2px solid transparent; outline-offset: 4px; border-radius: 4px; }
-      .frame {
-        aspect-ratio: 1; display: grid; place-items: center; overflow: hidden;
-        background: color-mix(in srgb, var(--dom, var(--wash)) 10%, var(--wash));
-        border-radius: 4px; transition: background .4s;
-      }
+      .tile { display: block; color: inherit; text-decoration: none; outline: 1px solid transparent; outline-offset: 6px; }
+      .frame { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
       .frame img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
-      .text { padding: 12px; font-size: 11px; line-height: 1.45; color: var(--mute); overflow: hidden; height: 100%; width: 100%; word-break: break-word; }
-      .pal { display: flex; height: 4px; margin-top: 8px; border-radius: 2px; overflow: hidden; background: var(--line); }
-      .pal i { min-width: 0; }
-      .cap { margin-top: 6px; font-size: 11px; color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .frame.is-text { align-items: stretch; border: 1px solid var(--rule); }
+      .text { padding: 15px; font-size: 15px; line-height: 20px; color: var(--ink); overflow: hidden; width: 100%; word-break: break-word; white-space: pre-line; }
+      .cap { margin-top: 18px; padding: 0 10px; text-align: center; color: var(--mute); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .tile:hover .cap { color: var(--ink); }
+      .dots { display: flex; justify-content: center; gap: 4px; margin-top: 6px; min-height: 7px; }
+      .dots i { width: 7px; height: 7px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgb(0 0 0 / .08); }
 
-      @media (max-width: 640px) {
-        .bar { padding: 12px 16px; }
-        .ribbon, .notice, .status { margin-left: 16px; margin-right: 16px; }
-        .modes { flex-wrap: nowrap; overflow-x: auto; max-width: 100%; scrollbar-width: none; }
-        .modes button { white-space: nowrap; }
-        .ribbon { margin-top: 2px; }
-        .grid { padding: 16px 16px 48px; gap: 20px 12px; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); }
+      @media (max-width: 800px) {
+        .meta { grid-template-columns: 1fr 1fr; }
+        .meta .colors { grid-column: 1 / -1; order: -1; }
+      }
+      @media (max-width: 560px) {
+        .head { flex-wrap: wrap; min-height: 0; padding-top: 20px; }
+        h1 { font-size: 22px; line-height: 28px; flex-basis: 100%; }
+        .meta { margin-top: 28px; }
+        .grid { gap: 40px 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .text { font-size: 12.5px; line-height: 16px; padding: 10px; }
       }
     `;
   }

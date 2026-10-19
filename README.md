@@ -10,6 +10,12 @@ Open a channel on are.na and click **Sort by color** (bottom right). The channel
 - **Channel order**: the original order, for comparison
 - **Reverse** flips any of them. Keys `1` to `4` switch modes, `Esc` closes.
 
+**Color tags.** Every block is indexed under simple color families: Red, Orange, Yellow, Green, Blue, Purple, Pink, Brown, White, Gray, Black. A block gets its dominant color plus any other color covering a real share of the image. Click a tag to show only those blocks; click more to combine them.
+
+**Search by color.** Type any color name or hex (`teal`, `#3366ff`, `rgb(200 40 40)`) or pick one from the color wheel. Blocks containing a close match show up, closest first.
+
+The view is styled to match Are.na: its own typeface, rules, buttons and grid.
+
 Text blocks and nested channels have no image, so they go to the end in their original order. Click a tile to open the block; click the ribbon to jump to a tile.
 
 ## Writing the order back

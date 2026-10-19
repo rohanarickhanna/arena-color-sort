@@ -180,7 +180,69 @@
     }
   }
 
-  const api = { rgbToOklab, labToLch, analyzePixels, sortItems, tinyImageUrl, NEUTRAL_CHROMA };
+  // Eleven broad families, the basic color words, so the index stays simple.
+  const FAMILIES = [
+    ['red', 'Red', [214, 40, 40]],
+    ['orange', 'Orange', [240, 130, 30]],
+    ['yellow', 'Yellow', [242, 205, 40]],
+    ['green', 'Green', [60, 160, 70]],
+    ['blue', 'Blue', [40, 100, 220]],
+    ['purple', 'Purple', [128, 70, 190]],
+    ['pink', 'Pink', [240, 120, 180]],
+    ['brown', 'Brown', [125, 82, 50]],
+    ['white', 'White', [246, 246, 246]],
+    ['gray', 'Gray', [140, 140, 140]],
+    ['black', 'Black', [20, 20, 20]],
+  ];
+
+  function familyOf(rgb) {
+    const { L, C, h } = labToLch(...rgbToOklab(rgb[0], rgb[1], rgb[2]));
+    if (C < NEUTRAL_CHROMA) return L > 0.88 ? 'white' : L < 0.32 ? 'black' : 'gray';
+    if (h < 15 || h >= 345) return L > 0.68 || C < 0.12 ? 'pink' : 'red';
+    if (h < 45) return L > 0.82 ? 'pink' : L < 0.42 && C < 0.12 ? 'brown' : 'red';
+    if (h < 75) return L < 0.6 ? 'brown' : 'orange';
+    if (h < 100) return L < 0.6 ? 'brown' : 'yellow';
+    if (h < 120) return L < 0.62 ? 'green' : 'yellow';
+    if (h < 180) return 'green';
+    if (h < 285) return 'blue';
+    if (h < 310) return 'purple';
+    return L > 0.6 ? 'pink' : 'purple';
+  }
+
+  // Families a block is indexed under: its dominant color, plus any other
+  // color covering a real share of the image. Grays need a bigger share, or
+  // every screenshot on a white page would be filed under White.
+  function familiesOf(color) {
+    if (!color) return [];
+    const out = new Set([familyOf(color.rgb)]);
+    for (const p of color.palette) {
+      const f = familyOf(p.rgb);
+      const neutral = f === 'white' || f === 'gray' || f === 'black';
+      if (p.weight >= (neutral ? 0.4 : 0.12)) out.add(f);
+    }
+    return [...out];
+  }
+
+  // How far a block is from a searched color: the OKLab distance to its
+  // nearest palette color, nudged so a big area of that color ranks first.
+  function distanceTo(color, rgb) {
+    if (!color) return Infinity;
+    const t = rgbToOklab(rgb[0], rgb[1], rgb[2]);
+    let best = Infinity;
+    for (const p of color.palette) {
+      if (p.weight < 0.1) continue;
+      const d = Math.sqrt(dist2(t, rgbToOklab(p.rgb[0], p.rgb[1], p.rgb[2]))) - 0.04 * p.weight;
+      if (d < best) best = d;
+    }
+    return best;
+  }
+  const MATCH_DISTANCE = 0.08;
+
+  const api = {
+    distanceTo, MATCH_DISTANCE,
+    rgbToOklab, labToLch, analyzePixels, sortItems, tinyImageUrl, familyOf, familiesOf,
+    FAMILIES, NEUTRAL_CHROMA,
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.ArenaColor = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
