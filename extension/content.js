@@ -214,8 +214,10 @@
   function onKey(e) {
     if (e.key === 'Escape') { e.preventDefault(); close(); return; }
     const n = Number(e.key);
-    const origin = e.composedPath()[0];
-    const typing = origin && origin.closest && origin.closest('input, textarea, [contenteditable]');
+    // composedPath() stops at a closed shadow root, so ask the root itself
+    // which field has focus.
+    const origin = shadow.activeElement;
+    const typing = origin && (origin.tagName === 'INPUT' || origin.tagName === 'TEXTAREA');
     if (n >= 1 && n <= MODES.length && !typing && !e.metaKey && !e.ctrlKey && !e.altKey) setMode(MODES[n - 1][0]);
   }
 
