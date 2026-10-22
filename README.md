@@ -41,3 +41,7 @@ npm run zip     # package extension/ for the Chrome Web Store
 ```
 
 No build step, no dependencies. `extension/color.js` is pure and tested under `node --test`; `extension/content.js` is the page UI.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
