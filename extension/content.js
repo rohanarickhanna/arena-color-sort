@@ -1,7 +1,7 @@
 // Are.na Color Sort: content script. Adds a "Sort by color" launcher to
-// channel pages, reads the channel through the public v3 API, measures each
-// block's dominant color, and shows the channel re-sorted. With a personal
-// access token it can also write the new order back to the channel.
+// channel pages and block search pages, reads them through the Are.na API,
+// measures each block's dominant color, and shows them re-sorted. On a channel,
+// a personal access token lets it write the new order back.
 (() => {
   'use strict';
   if (window.__arenaColorSort) return;
@@ -12,6 +12,7 @@
   const TOKEN_URL = 'https://www.are.na/settings/personal-access-tokens';
   const CONCURRENCY = 6;
   const SAMPLE = 32;
+  const SEARCH_MAX = 300; // blocks read from a search; the API is not for bulk harvesting
   // First path segments that are Are.na pages rather than user profiles.
   const RESERVED = new Set([
     'about', 'block', 'blog', 'channels', 'editorial', 'explore', 'feed', 'login',
@@ -54,15 +55,35 @@
     return (await store.get(['acs:token']))['acs:token'] || '';
   }
 
+  // Used for search only: requests go through the background worker (no CORS
+  // limits). Channels keep the plain fetch they always used.
+  async function request(url, init) {
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return fetch(url, init);
+    const r = await chrome.runtime.sendMessage({
+      type: 'acs:fetch', url, method: init.method, headers: init.headers, body: init.body,
+    });
+    if (!r || r.error) {
+      const err = new Error(r && r.error ? r.error : 'No response from the extension');
+      err.network = true;
+      throw err;
+    }
+    return {
+      status: r.status, ok: r.status >= 200 && r.status < 300,
+      headers: { get: (k) => r.headers[k.toLowerCase()] || null, has: (k) => k.toLowerCase() in r.headers },
+      json: async () => JSON.parse(r.body),
+    };
+  }
+
   async function api(path, opts = {}) {
     const token = await getToken();
     const headers = { Accept: 'application/json', ...(opts.headers || {}) };
     if (token) headers.Authorization = `Bearer ${token}`;
     if (opts.body) headers['Content-Type'] = 'application/json';
     for (let attempt = 0; attempt < 6; attempt++) {
-      const res = await fetch(API + path, { ...opts, headers });
+      let res;
+      try { res = await (opts.viaBackground ? request : fetch)((opts.base || API) + path, { ...opts, headers }); } catch (e) { e.network = true; throw e; }
       // A bad or revoked token should not break reading public channels.
-      if (res.status === 401 && headers.Authorization && (!opts.method || opts.method === 'GET')) {
+      if (res.status === 401 && headers.Authorization && !opts.needsAuth && (!opts.method || opts.method === 'GET')) {
         delete headers.Authorization;
         continue;
       }
@@ -101,6 +122,82 @@
       onPage(all.length, res.meta.total_count);
       if (!res.meta.has_more_pages) return all;
     }
+  }
+
+  // Search can return channels, users and groups next to blocks; drop those and
+  // keep anything else, so an unexpected block type label never empties the list.
+  const NOT_BLOCKS = new Set(['Channel', 'User', 'Group']);
+  const isBlock = (b) => b && !NOT_BLOCKS.has(b.type) && !NOT_BLOCKS.has(b.class);
+  const SEARCH_TABS = new Set(['all', 'blocks', 'channels', 'users', 'groups', 'images', 'texts', 'links', 'attachments', 'embeds']);
+
+  // v2 blocks to the v3 shape the rest of this file reads.
+  function fromV2(b) {
+    const img = b.image;
+    const type = b.class === 'Media' ? 'Embed' : b.class;
+    return {
+      id: b.id, type, title: b.title || b.generated_title || '', updated_at: b.updated_at,
+      image: img && (img.thumb || img.display || img.original) ? {
+        src: (img.original && img.original.url) || (img.display && img.display.url),
+        small: { src: (img.thumb && img.thumb.url) || (img.display && img.display.url) },
+        alt_text: '', updated_at: b.updated_at,
+      } : null,
+      content: b.content ? { plain: b.content } : null,
+      connection: null,
+    };
+  }
+
+  // v3 search needs a token (and Premium). If v3 refuses the account, try the
+  // older v2 search; if that fails too, say why instead of a bare network error.
+  // What the API actually sent back, for the status line when nothing shows.
+  function noteRaw(data, meta) {
+    const info = state.searchInfo || (state.searchInfo = { raw: 0, total: 0, types: new Set() });
+    info.raw += data.length;
+    info.total = (meta && meta.total_count) || info.total;
+    for (const d of data) info.types.add(d.type || d.class || '?');
+  }
+
+  const PAGE_SIZE = 100;
+  const CHUNK_PAGES = SEARCH_MAX / PAGE_SIZE;
+
+  // Reads one chunk of the results: pages chunk*3+1 .. chunk*3+3 of 100 each,
+  // i.e. results (chunk*300)+1 .. (chunk*300)+300.
+  async function searchBlocks(query, onPage, type = 'Block', chunk = 0) {
+    state.searchInfo = null;
+    const q = encodeURIComponent(query);
+    const all = [];
+    let useV2 = false;
+    for (let i = 0; i < CHUNK_PAGES; i++) {
+      const page = chunk * CHUNK_PAGES + i + 1;
+      let batch, more;
+      if (!useV2) {
+        try {
+          const res = await api(`/search?query=${q}&type=${encodeURIComponent(type)}&per=${PAGE_SIZE}&page=${page}`, { needsAuth: true, viaBackground: true });
+          batch = res.data.filter(isBlock);
+          noteRaw(res.data, res.meta);
+          more = res.meta.has_more_pages;
+        } catch (err) {
+          if (i === 0 && !err.network && (err.status === 401 || err.status === 402 || err.status === 403)) {
+            useV2 = true; state.v3Error = err; i--; continue;
+          }
+          throw err;
+        }
+      } else {
+        try {
+          const res = await api(`/search/blocks?q=${q}&per=${PAGE_SIZE}&page=${page}`, { base: 'https://api.are.na/v2', needsAuth: true, viaBackground: true });
+          batch = (res.blocks || []).map(fromV2).filter(isBlock);
+          noteRaw(res.blocks || [], { total_count: (res.total_pages || 1) * PAGE_SIZE });
+          more = page < (res.total_pages || 1) && (res.blocks || []).length > 0;
+        } catch (err) {
+          err.status = err.status || (state.v3Error && state.v3Error.status);
+          err.searchFailed = true;
+          throw err;
+        }
+      }
+      all.push(...batch);
+      onPage(all.length, state.searchInfo ? state.searchInfo.total : 0);
+      if (!more) break;
+    }
+    return all;
   }
 
   async function moveToTop(connectionId) {
@@ -162,10 +259,34 @@
 
   // ---------- page detection ----------
 
-  function channelSlug() {
+  // Are.na's search page keeps its state as JSON in ?q=, e.g.
+  // {"term":{"facet":"tree"},"what":{"facets":["BLOCK"]},...}. Pull out the
+  // words typed and, when one block kind is chosen, that kind.
+  const FACET_TYPES = { IMAGE: 'Image', TEXT: 'Text', LINK: 'Link', ATTACHMENT: 'Attachment', EMBED: 'Embed' };
+  function parseSearch(raw) {
+    if (raw[0] !== '{') return { query: raw, type: 'Block' };
+    try {
+      const j = JSON.parse(raw);
+      const term = j.term && (typeof j.term === 'string' ? j.term : j.term.facet || j.term.value || j.term.query);
+      const facets = ((j.what && j.what.facets) || []).map((f) => String(f).toUpperCase());
+      const kinds = facets.filter((f) => FACET_TYPES[f]).map((f) => FACET_TYPES[f]);
+      return { query: String(term || '').trim(), type: kinds.length ? kinds.join(',') : 'Block' };
+    } catch (_) {
+      return { query: raw, type: 'Block' };
+    }
+  }
+
+  // What this page can be sorted as: a channel, or a block search.
+  function pageContext() {
     const parts = location.pathname.split('/').filter(Boolean);
+    if (parts[0] === 'search') {
+      const params = new URLSearchParams(location.search);
+      const raw = (params.get('q') || params.get('query') || (parts[1] && !SEARCH_TABS.has(parts[1].toLowerCase()) && decodeURIComponent(parts[1])) || '').trim();
+      const { query, type } = parseSearch(raw);
+      return query ? { kind: 'search', query, type } : null;
+    }
     if (parts.length < 2 || RESERVED.has(parts[0])) return null;
-    return decodeURIComponent(parts[1]);
+    return { kind: 'channel', slug: decodeURIComponent(parts[1]) };
   }
 
   // ---------- UI ----------
@@ -184,19 +305,20 @@
 
   function mount() {
     if (!host.isConnected) document.documentElement.appendChild(host);
-    launch.hidden = !channelSlug() || !state.closed;
+    launch.hidden = !pageContext() || !state.closed;
   }
 
   let lastPath = '';
   setInterval(() => {
-    if (location.pathname !== lastPath) {
-      lastPath = location.pathname;
+    const here = location.pathname + location.search;
+    if (here !== lastPath) {
+      lastPath = here;
       if (!state.closed) close();
     }
     mount();
   }, 400);
 
-  launch.addEventListener('click', () => open(channelSlug()));
+  launch.addEventListener('click', () => open(pageContext()));
 
   // Are.na has single-key shortcuts (f jumps to search). The overlay is modal,
   // so while it is open no key event may reach the page: otherwise typing a
@@ -230,10 +352,11 @@
     mount();
   }
 
-  async function open(slug) {
-    if (!slug) return;
+  async function open(ctx) {
+    if (!ctx) return;
+    const isSearch = ctx.kind === 'search';
     Object.assign(state, {
-      closed: false, slug, items: [], mode: 'spectrum', reverse: false, filter: new Set(), search: null,
+      closed: false, ctx, items: [], mode: ctx.mode || 'spectrum', reverse: !!ctx.reverse, filter: new Set(), search: null,
       channel: null, measured: 0, busy: false, cancelApply: null,
       prevOverflow: document.documentElement.style.overflow,
     });
@@ -245,6 +368,7 @@
         <header class="head">
           <h1><span class="chan">Loading</span><span class="sep">/</span><span class="here"><span class="wheel" aria-hidden="true"></span>By color</span></h1>
           <div class="actions">
+            <button class="btn tok" hidden>Token</button>
             <button class="btn apply" disabled>Apply to channel</button>
             <button class="btn close" title="Close (Esc)">Close</button>
           </div>
@@ -272,7 +396,14 @@
               <div class="r"><span>Showing</span><span class="v-showing">0</span></div>
               <div class="r"><span>No image</span><span class="v-none">0</span></div>
             </div>
-            <p class="status" aria-live="polite">Reading channel</p>
+            <div class="statusrow">
+              <p class="status" aria-live="polite">Reading channel</p>
+              <span class="pager" hidden>
+                <button class="pg prev" aria-label="Previous 300 results" title="Previous 300 results">&larr;</button>
+                <span class="range"></span>
+                <button class="pg next" aria-label="Next 300 results" title="Next 300 results">&rarr;</button>
+              </span>
+            </div>
           </div>
         </section>
         <div class="ribbon" aria-hidden="true"></div>
@@ -281,6 +412,14 @@
       </div>`;
 
     overlay.querySelector('.close').onclick = close;
+    if (isSearch) {
+      overlay.querySelector('.apply').hidden = true; // search results have no order to write back
+      const tok = overlay.querySelector('.tok');
+      tok.hidden = false;
+      tok.onclick = showTokenForm;
+      overlay.querySelector('.chan').textContent = `Search: ${ctx.query}`;
+      status('Searching');
+    }
     overlay.querySelector('.rev').onclick = (e) => {
       state.reverse = !state.reverse;
       e.currentTarget.setAttribute('aria-pressed', state.reverse);
@@ -313,15 +452,28 @@
       if (tile) { tile.scrollIntoView({ block: 'center', behavior: 'smooth' }); flash(tile); }
     };
     markMode();
+    overlay.querySelector('.rev').setAttribute('aria-pressed', state.reverse);
 
     try {
-      const channel = await api(`/channels/${encodeURIComponent(slug)}`);
-      if (state.closed) return;
-      state.channel = channel;
-      overlay.querySelector('.chan').textContent = channel.title;
-      const blocks = await fetchContents(channel.id, (got, total) => {
-        status(`Reading channel ${got} / ${total}`);
-      });
+      let blocks;
+      if (isSearch) {
+        if (!(await getToken())) {
+          status('');
+          showTokenForm('Searching Are.na through the API needs a personal access token (and a Premium account).');
+          return;
+        }
+        blocks = await searchBlocks(ctx.query, (got, total) => {
+          status(`Reading results ${got}${total > got ? ' of ' + total : ''}`);
+        }, ctx.type, ctx.chunk || 0);
+      } else {
+        const channel = await api(`/channels/${encodeURIComponent(ctx.slug)}`);
+        if (state.closed) return;
+        state.channel = channel;
+        overlay.querySelector('.chan').textContent = channel.title;
+        blocks = await fetchContents(channel.id, (got, total) => {
+          status(`Reading channel ${got} / ${total}`);
+        });
+      }
       if (state.closed) return;
       state.items = blocks.map((block, index) => ({
         block, index, color: null,
@@ -344,17 +496,52 @@
       if (state.closed) return;
       const measured = state.items.filter((it) => it.color).length;
       const without = state.items.length - measured;
-      status(without ? 'Blocks without an image go last.' : '');
+      const info = state.searchInfo;
+      status(isSearch && !state.items.length
+        ? `No blocks found for "${ctx.query}". Are.na returned ${info ? info.raw : 0} results${info && info.types.size ? ` (types: ${[...info.types].join(', ')})` : ''}.`
+        : (without ? 'Blocks without an image go last.' : ''));
+      if (isSearch) showPager();
       overlay.querySelector('.apply').disabled = false;
       render(true);
-      showRestoreIfSaved();
+      if (!isSearch) showRestoreIfSaved();
     } catch (err) {
       if (state.closed) return;
-      status(err.status === 404 || err.status === 401 || err.status === 403
-        ? 'This channel could not be read. If it is private, add a personal access token under Apply to channel.'
-        : `Something went wrong: ${err.message}`);
+      if (isSearch && (err.status === 401 || err.status === 403 || err.status === 402 || err.network)) {
+        status(err.status === 401 ? 'Are.na rejected the token. Check it, or replace it with the Token button.'
+          : err.status === 402 || err.status === 403 ? 'Are.na search is a Premium feature, and this account was refused.'
+          : `Could not reach Are.na search (${err.message}).`);
+      } else {
+        status(err.status === 404 || err.status === 401 || err.status === 403
+          ? 'This channel could not be read. If it is private, add a personal access token under Apply to channel.'
+          : `Something went wrong: ${err.message}`);
+      }
       overlay.querySelector('.apply').disabled = false;
     }
+  }
+
+  // Back/forward through a search, 300 results at a time. Reopens the view on
+  // the new chunk and keeps the chosen order.
+  function showPager() {
+    const info = state.searchInfo;
+    const chunk = state.ctx.chunk || 0;
+    const start = chunk * SEARCH_MAX + 1;
+    const end = chunk * SEARCH_MAX + (info ? info.raw : 0);
+    const total = info && info.total;
+    const pager = overlay.querySelector('.pager');
+    const prev = pager.querySelector('.prev'), next = pager.querySelector('.next');
+    pager.querySelector('.range').textContent = end >= start
+      ? `${start.toLocaleString()}\u2013${end.toLocaleString()}${total ? ' of ' + total.toLocaleString() : ''}`
+      : '';
+    prev.disabled = chunk === 0;
+    next.disabled = !total || chunk * SEARCH_MAX + SEARCH_MAX >= total || (info && info.raw < SEARCH_MAX);
+    const go = (delta) => {
+      const ctx = { ...state.ctx, chunk: chunk + delta, mode: state.mode, reverse: state.reverse };
+      close();
+      open(ctx);
+    };
+    prev.onclick = () => go(-1);
+    next.onclick = () => go(1);
+    pager.hidden = false;
   }
 
   function status(text) {
@@ -563,12 +750,13 @@
     return n < 100 ? 'It takes under a minute.' : `It takes about ${minutes} minutes on a free account.`;
   }
 
-  function showTokenForm() {
+  function showTokenForm(why) {
+    const intro = typeof why === 'string' ? why : 'Reordering needs an Are.na personal access token with write access.';
     const el = notice(`
-      <p><strong>Reordering needs an Are.na personal access token with write access.</strong>
+      <p><strong>${esc(intro)}</strong>
       Create one at <a href="${TOKEN_URL}" target="_blank" rel="noopener">are.na/settings/personal-access-tokens</a>
       and paste it here. It is stored only in this browser and sent only to api.are.na.
-      You can reorder channels you own or collaborate on.</p>
+      ${state.ctx && state.ctx.kind === 'search' ? 'It is sent as a read-only credential with search requests.' : 'You can reorder channels you own or collaborate on.'}</p>
       <form class="row">
         <input type="password" placeholder="Personal access token" autocomplete="off" spellcheck="false">
         <button class="primary" type="submit">Save</button>
@@ -581,7 +769,8 @@
       const v = input.value.trim();
       if (!v) return;
       await store.set({ 'acs:token': v });
-      if (!state.items.length) { const slug = state.slug; close(); open(slug); return; }
+      if (!state.items.length) { const ctx = state.ctx; close(); open(ctx); return; }
+      if (state.ctx && state.ctx.kind === 'search') { const ctx = state.ctx; close(); open(ctx); return; }
       showApply();
     };
     el.querySelector('form').onsubmit = (e) => { e.preventDefault(); save(); };
@@ -790,7 +979,12 @@
 
       .rows .r { display: flex; justify-content: space-between; padding: 0 0 2px; margin-bottom: 3px; border-bottom: 1px solid var(--rule2); color: var(--mute); }
       .rows .r span:last-child { color: var(--ink); font-variant-numeric: tabular-nums; }
-      .status { margin: 8px 0 0; color: var(--mute); }
+      .statusrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 8px; }
+      .status { margin: 0; color: var(--mute); }
+      .pager { display: inline-flex; align-items: center; gap: 6px; color: var(--mute); font-variant-numeric: tabular-nums; }
+      .pg { width: 22px; height: 22px; border-radius: 3px; background: var(--btn); color: var(--ink); text-align: center; font-weight: 700; }
+      .pg:hover:not(:disabled) { box-shadow: inset 0 0 0 1px var(--rule); }
+      .pg:disabled { opacity: .35; cursor: default; }
 
       .ribbon { display: flex; height: 6px; margin-top: 45px; overflow: hidden; cursor: pointer; }
       .ribbon i { flex: 1; min-width: 0; }
