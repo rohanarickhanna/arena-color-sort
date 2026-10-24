@@ -4,7 +4,10 @@ A Chrome extension that sorts any Are.na channel & block search results by color
 
 Open a channel or search on are.na and click **Sort by color** (bottom right). The channel opens in a full-screen view, re-sorted by each block's dominant color, with a ribbon of every block's color across the top.
 
-- note that search results will be filtered by 300 blocks at a time. users can click on reverse / forward arrows to load the previous / next 300 search results. 
+- Note that search results will be filtered by 300 blocks at a time. users can click on reverse / forward arrows to load the previous / next 300 search results.
+- Filtering thru search results is unfortunately only available to premium are.na users, as search queries through API requires the subscription (& token). 
+
+  
 - **Spectrum**: red through orange, yellow, green, blue, purple, pink, then grays from white to black
 - **Light to dark**: by the whole image's lightness
 - **Vivid to muted**: by how saturated the dominant color is
