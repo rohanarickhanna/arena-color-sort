@@ -3,13 +3,28 @@
   "name": "Are.na Color Sort",
   "version": "0.1.0",
   "description": "Sort any Are.na channel by color, and optionally write the new order back to the channel.",
-  "permissions": ["storage"],
-  "host_permissions": ["https://api.are.na/*", "https://images.are.na/*", "https://d2w9rnfcy7mm78.cloudfront.net/*"],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://api.are.na/*",
+    "https://images.are.na/*",
+    "https://d2w9rnfcy7mm78.cloudfront.net/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://www.are.na/*", "https://are.na/*"],
-      "js": ["color.js", "content.js"],
+      "matches": [
+        "https://www.are.na/*",
+        "https://are.na/*"
+      ],
+      "js": [
+        "color.js",
+        "content.js"
+      ],
       "run_at": "document_start"
     }
-  ]
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
 }
