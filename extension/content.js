@@ -113,6 +113,11 @@
         await sleep(waitFor(res) || 2000 * (attempt + 1));
         continue;
       }
+      // Search can time out (408) or hit a server error; reads are safe to retry.
+      if ((res.status === 408 || res.status >= 500) && (!opts.method || opts.method === 'GET') && attempt < 5) {
+        await sleep(1500 * (attempt + 1));
+        continue;
+      }
       if (!res.ok) {
         const err = new Error(`Are.na API ${res.status}`);
         err.status = res.status;
@@ -541,13 +546,15 @@
           ? 'This channel could not be read. If it is private, add a personal access token under Apply to channel.'
           : `Something went wrong: ${err.message}`);
       }
+      // Keep the arrows when a later set of results fails, so you can go back or retry.
+      if (isSearch && !err.searchFailed && err.status !== 401 && err.status !== 402 && err.status !== 403) showPager(true);
       overlay.querySelector('.apply').disabled = false;
     }
   }
 
   // Back/forward through a search, 300 results at a time. Reopens the view on
   // the new chunk and keeps the chosen order.
-  function showPager() {
+  function showPager(failed) {
     const info = state.searchInfo;
     const chunk = state.ctx.chunk || 0;
     const start = chunk * SEARCH_MAX + 1;
@@ -559,9 +566,11 @@
       ? `${start.toLocaleString()}\u2013${end.toLocaleString()}${total ? ' of ' + total.toLocaleString() : ''}`
       : '';
     prev.disabled = chunk === 0;
-    next.disabled = !total || chunk * SEARCH_MAX + SEARCH_MAX >= total || (info && info.raw < SEARCH_MAX);
+    // After a failure, next retries this same set of results.
+    next.title = failed ? 'Try these results again' : 'Next 300 results';
+    next.disabled = failed ? false : !total || chunk * SEARCH_MAX + SEARCH_MAX >= total || (info && info.raw < SEARCH_MAX);
     const go = (delta) => {
-      const ctx = { ...state.ctx, chunk: chunk + delta, mode: state.mode, reverse: state.reverse };
+      const ctx = { ...state.ctx, chunk: failed && delta > 0 ? chunk : chunk + delta, mode: state.mode, reverse: state.reverse };
       close();
       open(ctx);
     };
