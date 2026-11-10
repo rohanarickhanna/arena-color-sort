@@ -79,11 +79,28 @@
 
   // Used for search only: requests go through the background worker (no CORS
   // limits). Channels keep the plain fetch they always used.
+  // After the extension is reloaded in chrome://extensions, the copy already
+  // running in an open tab is cut off: every chrome.* call fails with
+  // "Extension context invalidated". Only refreshing the tab fixes it.
+  const contextGone = () => typeof chrome !== 'undefined' && chrome.runtime && !chrome.runtime.id;
+  function goneError() {
+    const err = new Error('The extension was reloaded. Refresh this page to use it.');
+    err.contextGone = true;
+    return err;
+  }
+
   async function request(url, init) {
     if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return fetch(url, init);
-    const r = await chrome.runtime.sendMessage({
-      type: 'acs:fetch', url, method: init.method, headers: init.headers, body: init.body,
-    });
+    if (contextGone()) throw goneError();
+    let r;
+    try {
+      r = await chrome.runtime.sendMessage({
+        type: 'acs:fetch', url, method: init.method, headers: init.headers, body: init.body,
+      });
+    } catch (e) {
+      if (contextGone() || /context invalidated/i.test(e && e.message)) throw goneError();
+      throw e;
+    }
     if (!r || r.error) {
       const err = new Error(r && r.error ? r.error : 'No response from the extension');
       err.network = true;
@@ -102,6 +119,7 @@
     if (token) headers.Authorization = `Bearer ${token}`;
     if (opts.body) headers['Content-Type'] = 'application/json';
     for (let attempt = 0; attempt < 6; attempt++) {
+      if (opts.stale && opts.stale()) throw Object.assign(new Error('stale'), { stale: true });
       let res;
       try { res = await (opts.viaBackground ? request : fetch)((opts.base || API) + path, { ...opts, headers }); } catch (e) { e.network = true; throw e; }
       // A bad or revoked token should not break reading public channels.
@@ -110,14 +128,17 @@
         continue;
       }
       if (res.status === 429) {
+        if (opts.onRetry) opts.onRetry(res.status, attempt + 1);
         await sleep(waitFor(res) || 2000 * (attempt + 1));
         continue;
       }
       // Search can time out (408) or hit a server error; reads are safe to retry.
-      if ((res.status === 408 || res.status >= 500) && (!opts.method || opts.method === 'GET') && attempt < 5) {
+      if ((res.status === 408 || res.status >= 500) && (!opts.method || opts.method === 'GET') && attempt < 3) {
+        if (opts.onRetry) opts.onRetry(res.status, attempt + 1);
         await sleep(1500 * (attempt + 1));
         continue;
       }
+      if (opts.stale && opts.stale()) throw Object.assign(new Error('stale'), { stale: true });
       if (!res.ok) {
         const err = new Error(`Are.na API ${res.status}`);
         err.status = res.status;
@@ -176,8 +197,9 @@
   // v3 search needs a token (and Premium). If v3 refuses the account, try the
   // older v2 search; if that fails too, say why instead of a bare network error.
   // What the API actually sent back, for the status line when nothing shows.
-  function noteRaw(data, meta) {
-    const info = state.searchInfo || (state.searchInfo = { raw: 0, total: 0, types: new Set() });
+  // Each search keeps its own tally, so a load that was abandoned (arrow
+  // clicked mid-load) can never write into the view that replaced it.
+  function noteRaw(info, data, meta) {
     info.raw += data.length;
     info.total = (meta && meta.total_count) || info.total;
     for (const d of data) info.types.add(d.type || d.class || '?');
@@ -188,8 +210,7 @@
 
   // Reads one chunk of the results: pages chunk*3+1 .. chunk*3+3 of 100 each,
   // i.e. results (chunk*300)+1 .. (chunk*300)+300.
-  async function searchBlocks(query, onPage, type = 'Block', chunk = 0) {
-    state.searchInfo = null;
+  async function searchBlocks(query, onPage, type = 'Block', chunk = 0, info, hooks = {}) {
     const q = encodeURIComponent(query);
     const all = [];
     // Search pages can overlap, so the same block may come back twice.
@@ -201,10 +222,17 @@
       let batch, more;
       if (!useV2) {
         try {
-          const res = await api(`/search?query=${q}&type=${encodeURIComponent(type)}&per=${PAGE_SIZE}&page=${page}`, { needsAuth: true, viaBackground: true });
+          const res = await api(`/search?query=${q}&type=${encodeURIComponent(type)}&per=${PAGE_SIZE}&page=${page}`, { needsAuth: true, viaBackground: true, ...hooks });
           batch = res.data.filter(isBlock);
-          noteRaw(res.data, res.meta);
-          more = res.meta.has_more_pages;
+          const meta = res.meta || {};
+          noteRaw(info, res.data, meta);
+          // Trust has_more_pages when Are.na sends it; otherwise fall back to
+          // next_page, then to "this page came back full".
+          more = typeof meta.has_more_pages === 'boolean' ? meta.has_more_pages
+            : meta.next_page != null ? true
+            : res.data.length >= PAGE_SIZE;
+          console.info(`[Color Sort] search page ${page}: ${res.data.length} results`,
+            { has_more_pages: meta.has_more_pages, next_page: meta.next_page, total_count: meta.total_count, total_pages: meta.total_pages, per_page: meta.per_page });
         } catch (err) {
           if (i === 0 && !err.network && (err.status === 401 || err.status === 402 || err.status === 403)) {
             useV2 = true; state.v3Error = err; i--; continue;
@@ -213,10 +241,11 @@
         }
       } else {
         try {
-          const res = await api(`/search/blocks?q=${q}&per=${PAGE_SIZE}&page=${page}`, { base: 'https://api.are.na/v2', needsAuth: true, viaBackground: true });
+          const res = await api(`/search/blocks?q=${q}&per=${PAGE_SIZE}&page=${page}`, { base: 'https://api.are.na/v2', needsAuth: true, viaBackground: true, ...hooks });
           batch = (res.blocks || []).map(fromV2).filter(isBlock);
-          noteRaw(res.blocks || [], { total_count: (res.total_pages || 1) * PAGE_SIZE });
+          noteRaw(info, res.blocks || [], { total_count: (res.total_pages || 1) * PAGE_SIZE });
           more = page < (res.total_pages || 1) && (res.blocks || []).length > 0;
+          console.info(`[Color Sort] v2 search page ${page}: ${(res.blocks || []).length} results`, { total_pages: res.total_pages });
         } catch (err) {
           err.status = err.status || (state.v3Error && state.v3Error.status);
           err.searchFailed = true;
@@ -224,7 +253,8 @@
         }
       }
       all.push(...batch.filter(fresh));
-      onPage(all.length, state.searchInfo ? state.searchInfo.total : 0);
+      info.more = more;
+      onPage(all.length, info.total);
       if (!more) break;
     }
     return all;
@@ -261,7 +291,7 @@
 
   const cacheKey = (block) => `acs:c2:${block.id}:${(block.image && block.image.updated_at) || ''}`;
 
-  async function colorBlocks(items, onColor) {
+  async function colorBlocks(items, onColor, stale = () => state.closed) {
     const cached = await store.get(items.map((it) => cacheKey(it.block)));
     const queue = [];
     for (const it of items) {
@@ -273,14 +303,14 @@
     const flush = async () => { const p = pending; pending = {}; if (Object.keys(p).length) await store.set(p); };
     let next = 0;
     async function worker() {
-      while (next < queue.length && !state.closed) {
+      while (next < queue.length && !stale()) {
         const it = queue[next++];
         for (const url of imageSources(it.block)) {
           try { it.color = await measure(url); break; } catch (_) { /* try next size */ }
         }
         if (it.color) pending[cacheKey(it.block)] = it.color;
         if (Object.keys(pending).length >= 25) await flush();
-        onColor(it);
+        if (!stale()) onColor(it);
       }
     }
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
@@ -348,7 +378,10 @@
     mount();
   }, 400);
 
-  launch.addEventListener('click', () => open(pageContext()));
+  launch.addEventListener('click', () => {
+    if (contextGone()) { location.reload(); return; } // stale copy: a refresh loads the current one
+    open(pageContext());
+  });
 
   // Are.na has single-key shortcuts (f jumps to search). The overlay is modal,
   // so while it is open no key event may reach the page: otherwise typing a
@@ -385,9 +418,14 @@
   async function open(ctx) {
     if (!ctx) return;
     const isSearch = ctx.kind === 'search';
+    // Every open() is one load. Clicking an arrow starts a new one while the
+    // old one may still be awaiting the API; `stale()` tells the old one to stop
+    // instead of writing into the new view.
+    const gen = (state.gen || 0) + 1;
+    const stale = () => state.closed || state.gen !== gen;
     Object.assign(state, {
-      closed: false, ctx, items: [], mode: ctx.mode || 'spectrum', reverse: !!ctx.reverse, filter: new Set(), search: null,
-      channel: null, measured: 0, busy: false, cancelApply: null,
+      closed: false, gen, ctx, items: [], mode: ctx.mode || 'spectrum', reverse: !!ctx.reverse, filter: new Set(), search: null,
+      channel: null, measured: 0, busy: false, cancelApply: null, searchInfo: null, tiles: new Map(),
       prevOverflow: document.documentElement.style.overflow,
     });
     document.documentElement.style.overflow = 'hidden';
@@ -484,6 +522,10 @@
     markMode();
     overlay.querySelector('.rev').setAttribute('aria-pressed', state.reverse);
 
+    // Search: show the arrows straight away, so a slow or failing set of
+    // results never leaves you without a way back.
+    if (isSearch) showPager('loading');
+
     try {
       let blocks;
       if (isSearch) {
@@ -492,19 +534,26 @@
           showTokenForm('Searching Are.na through the API needs a personal access token (and a Premium account).');
           return;
         }
+        if (stale()) return;
+        const info = { raw: 0, total: 0, types: new Set() };
         blocks = await searchBlocks(ctx.query, (got, total) => {
-          status(`Reading results ${got}${total > got ? ' of ' + total : ''}`);
-        }, ctx.type, ctx.chunk || 0);
+          if (!stale()) status(`Reading results ${got}${total > got ? ' of ' + total : ''}`);
+        }, ctx.type, ctx.chunk || 0, info, {
+          stale,
+          onRetry: (code, n) => { if (!stale()) status(`Are.na is slow to answer (${code}). Retrying, attempt ${n}`); },
+        });
+        if (stale()) return;
+        state.searchInfo = info;
       } else {
         const channel = await api(`/channels/${encodeURIComponent(ctx.slug)}`);
-        if (state.closed) return;
+        if (stale()) return;
         state.channel = channel;
         overlay.querySelector('.chan').textContent = channel.title;
         blocks = await fetchContents(channel.id, (got, total) => {
-          status(`Reading channel ${got} / ${total}`);
+          if (!stale()) status(`Reading channel ${got} / ${total}`);
         });
       }
-      if (state.closed) return;
+      if (stale()) return;
       state.items = blocks.map((block, index) => ({
         block, index, color: null,
         // Keys must be unique: a shared key orphans a tile outside the sort.
@@ -512,6 +561,7 @@
       }));
       buildTiles();
       overlay.querySelector('.v-blocks').textContent = state.items.length;
+      if (isSearch) showPager();
       status(`Reading colors 0 / ${state.items.length}`);
       let done = 0;
       await colorBlocks(state.items, (it) => {
@@ -523,54 +573,83 @@
           status(`Reading colors ${done} / ${state.items.length}`);
           renderIndex();
         }
-      });
-      if (state.closed) return;
+      }, stale);
+      if (stale()) return;
       const measured = state.items.filter((it) => it.color).length;
       const without = state.items.length - measured;
       const info = state.searchInfo;
       status(isSearch && !state.items.length
         ? `No blocks found for "${ctx.query}". Are.na returned ${info ? info.raw : 0} results${info && info.types.size ? ` (types: ${[...info.types].join(', ')})` : ''}.`
         : (without ? 'Blocks without an image go last.' : ''));
-      if (isSearch) showPager();
       overlay.querySelector('.apply').disabled = false;
       render(true);
       if (!isSearch) showRestoreIfSaved();
     } catch (err) {
-      if (state.closed) return;
+      if (err.stale || stale()) return;
+      if (err.contextGone || contextGone() || /context invalidated/i.test(err.message)) {
+        status('');
+        notice(`<p><strong>The extension was updated or reloaded.</strong> Refresh this page to keep using it.</p>
+          <div class="row"><button class="primary" data-act="reload">Refresh page</button></div>`)
+          .querySelector('[data-act="reload"]').onclick = () => location.reload();
+        overlay.querySelector('.pager').hidden = true;
+        return;
+      }
+      const chunk = ctx.chunk || 0;
+      const range = `${(chunk * SEARCH_MAX + 1).toLocaleString()}–${((chunk + 1) * SEARCH_MAX).toLocaleString()}`;
       if (isSearch && (err.status === 401 || err.status === 403 || err.status === 402 || err.network)) {
         status(err.status === 401 ? 'Are.na rejected the token. Check it, or replace it with the Token button.'
           : err.status === 402 || err.status === 403 ? 'Are.na search is a Premium feature, and this account was refused.'
-          : `Could not reach Are.na search (${err.message}).`);
+          : `Could not reach Are.na search (${err.message}). Use → to try again.`);
+      } else if (isSearch) {
+        status(err.status === 400
+          ? `Are.na will not page this far into these results (${err.message}). Narrow the search.`
+          : `Results ${range} did not load (${err.message}). Use → to try again, or ← to go back.`);
       } else {
         status(err.status === 404 || err.status === 401 || err.status === 403
           ? 'This channel could not be read. If it is private, add a personal access token under Apply to channel.'
           : `Something went wrong: ${err.message}`);
       }
-      // Keep the arrows when a later set of results fails, so you can go back or retry.
-      if (isSearch && !err.searchFailed && err.status !== 401 && err.status !== 402 && err.status !== 403) showPager(true);
+      // Keep the arrows when a set of results fails, so you can go back or retry.
+      if (isSearch && err.status !== 401 && err.status !== 402 && err.status !== 403) showPager(err.status === 400 ? 'loading' : 'failed');
       overlay.querySelector('.apply').disabled = false;
     }
   }
 
   // Back/forward through a search, 300 results at a time. Reopens the view on
   // the new chunk and keeps the chosen order.
-  function showPager(failed) {
+  //   phase 'loading': results not in yet; back works, forward waits.
+  //   phase 'failed':  forward retries this same set of results.
+  //   no phase:        results loaded; forward only if there are more.
+  function showPager(phase) {
     const info = state.searchInfo;
     const chunk = state.ctx.chunk || 0;
     const start = chunk * SEARCH_MAX + 1;
     const end = chunk * SEARCH_MAX + (info ? info.raw : 0);
-    const total = info && info.total;
+    const total = (info && info.total) || state.ctx.total || 0;
     const pager = overlay.querySelector('.pager');
     const prev = pager.querySelector('.prev'), next = pager.querySelector('.next');
-    pager.querySelector('.range').textContent = end >= start
-      ? `${start.toLocaleString()}\u2013${end.toLocaleString()}${total ? ' of ' + total.toLocaleString() : ''}`
-      : '';
+    // The range is the positions in the search this set covers (301–600), not
+    // a count: Are.na sometimes returns a few fewer than asked for per page
+    // (most likely dropping items you cannot see), and that is not a gap.
+    const last = info && info.more === false
+      ? (total ? Math.min(total, chunk * SEARCH_MAX + SEARCH_MAX) : end)
+      : chunk * SEARCH_MAX + SEARCH_MAX;
+    const rangeText = last >= start ? `${start.toLocaleString()}–${last.toLocaleString()}` : '';
+    const rangeEl = pager.querySelector('.range');
+    rangeEl.textContent = rangeText && (rangeText + (total ? ' of ' + total.toLocaleString() : ''));
+    rangeEl.title = info && !phase ? `Are.na returned ${info.raw} results for this set` : '';
     prev.disabled = chunk === 0;
-    // After a failure, next retries this same set of results.
-    next.title = failed ? 'Try these results again' : 'Next 300 results';
-    next.disabled = failed ? false : !total || chunk * SEARCH_MAX + SEARCH_MAX >= total || (info && info.raw < SEARCH_MAX);
+    next.title = phase === 'failed' ? 'Try these results again' : 'Next 300 results';
+    next.setAttribute('aria-label', next.title);
+    next.disabled = phase === 'failed' ? false
+      : phase === 'loading' ? true
+      // Only disable forward when Are.na said there is nothing more. A missing
+      // total or a short page is not proof of the end.
+      : !!info && (info.more === false || (info.total > 0 && end >= info.total));
+    if (!phase && next.disabled) next.title = 'No more results';
     const go = (delta) => {
-      const ctx = { ...state.ctx, chunk: failed && delta > 0 ? chunk : chunk + delta, mode: state.mode, reverse: state.reverse };
+      const target = phase === 'failed' && delta > 0 ? chunk : Math.max(0, chunk + delta);
+      const ctx = { ...state.ctx, chunk: target, total, mode: state.mode, reverse: state.reverse };
       close();
       open(ctx);
     };
