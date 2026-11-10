@@ -51,8 +51,30 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  // The token lives in local storage with a copy in sync storage, so it is
+  // still there after a restart or a reinstall and never has to be re-entered.
+  const sync = hasStore && chrome.storage.sync;
+  let backedUp = false;
   async function getToken() {
-    return (await store.get(['acs:token']))['acs:token'] || '';
+    const local = (await store.get(['acs:token']))['acs:token'];
+    if (local && sync && !backedUp) {
+      backedUp = true; // a token saved before the sync copy existed
+      sync.get(['acs:token']).then((s) => { if (!s['acs:token']) return sync.set({ 'acs:token': local }); }).catch(() => {});
+    }
+    if (local || !sync) return local || '';
+    try {
+      const kept = (await sync.get(['acs:token']))['acs:token'];
+      if (kept) await store.set({ 'acs:token': kept });
+      return kept || '';
+    } catch (_) { return ''; }
+  }
+  async function setToken(v) {
+    await store.set({ 'acs:token': v });
+    if (sync) try { await sync.set({ 'acs:token': v }); } catch (_) { /* local copy is enough */ }
+  }
+  async function removeToken() {
+    await store.remove('acs:token');
+    if (sync) try { await sync.remove('acs:token'); } catch (_) { /* nothing to clear */ }
   }
 
   // Used for search only: requests go through the background worker (no CORS
@@ -165,6 +187,9 @@
     state.searchInfo = null;
     const q = encodeURIComponent(query);
     const all = [];
+    // Search pages can overlap, so the same block may come back twice.
+    const seen = new Set();
+    const fresh = (b) => !seen.has(b.id) && seen.add(b.id);
     let useV2 = false;
     for (let i = 0; i < CHUNK_PAGES; i++) {
       const page = chunk * CHUNK_PAGES + i + 1;
@@ -193,7 +218,7 @@
           throw err;
         }
       }
-      all.push(...batch);
+      all.push(...batch.filter(fresh));
       onPage(all.length, state.searchInfo ? state.searchInfo.total : 0);
       if (!more) break;
     }
@@ -308,7 +333,7 @@
     launch.hidden = !pageContext() || !state.closed;
   }
 
-  let lastPath = '';
+  let lastPath = location.pathname + location.search;
   setInterval(() => {
     const here = location.pathname + location.search;
     if (here !== lastPath) {
@@ -477,7 +502,8 @@
       if (state.closed) return;
       state.items = blocks.map((block, index) => ({
         block, index, color: null,
-        key: String(block.connection ? block.connection.id : `${block.type}-${block.id}`),
+        // Keys must be unique: a shared key orphans a tile outside the sort.
+        key: String(block.connection ? block.connection.id : `${block.type}-${block.id}-${index}`),
       }));
       buildTiles();
       overlay.querySelector('.v-blocks').textContent = state.items.length;
@@ -755,7 +781,7 @@
     const el = notice(`
       <p><strong>${esc(intro)}</strong>
       Create one at <a href="${TOKEN_URL}" target="_blank" rel="noopener">are.na/settings/personal-access-tokens</a>
-      and paste it here. It is stored only in this browser and sent only to api.are.na.
+      and paste it here. It is saved in your Chrome profile, so you only enter it once, and sent only to api.are.na.
       ${state.ctx && state.ctx.kind === 'search' ? 'It is sent as a read-only credential with search requests.' : 'You can reorder channels you own or collaborate on.'}</p>
       <form class="row">
         <input type="password" placeholder="Personal access token" autocomplete="off" spellcheck="false">
@@ -765,16 +791,17 @@
       </form>`);
     const input = el.querySelector('input');
     input.focus();
+    getToken().then((t) => { if (t && !input.value) input.value = t; });
     const save = async () => {
       const v = input.value.trim();
       if (!v) return;
-      await store.set({ 'acs:token': v });
+      await setToken(v);
       if (!state.items.length) { const ctx = state.ctx; close(); open(ctx); return; }
       if (state.ctx && state.ctx.kind === 'search') { const ctx = state.ctx; close(); open(ctx); return; }
       showApply();
     };
     el.querySelector('form').onsubmit = (e) => { e.preventDefault(); save(); };
-    el.querySelector('[data-act="clear"]').onclick = async () => { await store.remove('acs:token'); notice(''); };
+    el.querySelector('[data-act="clear"]').onclick = async () => { await removeToken(); notice(''); };
     el.querySelector('[data-act="dismiss"]').onclick = () => notice('');
   }
 

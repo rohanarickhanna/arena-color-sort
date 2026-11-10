@@ -24,7 +24,7 @@ Text blocks and nested channels have no image, so they go to the end in their or
 
 ## Writing the order back
 
-**Apply to channel** reorders the real channel to match the view. This needs an Are.na personal access token with write access (create one at are.na/settings/personal-access-tokens), and works on channels you own or collaborate on. The token is kept in this browser's extension storage and sent only to api.are.na.
+**Apply to channel** reorders the real channel to match the view. This needs an Are.na personal access token with write access (create one at are.na/settings/personal-access-tokens), and works on channels you own or collaborate on. The token is saved in the extension's storage (synced with your Chrome profile when Chrome sync is on), so you enter it once and it is filled in from then on. It is sent only to api.are.na.
 
 Before the first move, the channel's current order is saved in the extension so **Restore original order** can put it back. Reordering is one API call per block (about 120 a minute on a free account), so keep the tab open while it runs.
 
